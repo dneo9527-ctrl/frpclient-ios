@@ -1,0 +1,15 @@
+# Local signing and generated artifacts
+.team-id
+build/
+*.ipa
+*.xcarchive
+ios/FrpClient/Frameworks/
+go/.gomodcache/
+go/.gopath/
+go/.gocache/
+.DS_Store
+*.xcuserdata/
+DerivedData/
+verification/private/
+verification/*.log
+verification/controller-tests

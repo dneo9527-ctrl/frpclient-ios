@@ -1,0 +1,43 @@
+{
+  "version": "1.2.0",
+  "build": "3",
+  "bundle_id": "com.doc.frpclient",
+  "minimum_ios": "15.0",
+  "signed": false,
+  "scope": "clean public source and separately rebuilt unsigned IPA; no live private configuration read",
+  "privacy_defaults": "server, token, and secretKey empty in all new profiles",
+  "payload_policy": "five standard app payload files; no config, preferences, Keychain data, original IPA, or test fixtures",
+  "features": [
+    "three independent VPS profiles",
+    "safe single-profile migration into profile 1",
+    "lifecycle-safe switching and retry isolation",
+    "redacted logs and in-memory TOML parsing"
+  ],
+  "verification_status": "passed local controller/race tests and unsigned release build/default/path audit; independent code reviews found no blocking issue",
+  "verified_locally": [
+    "Swift controller 27/27",
+    "Go race tests",
+    "iPhoneOS Release rebuild",
+    "final IPA blank-default/closed-payload/path audit",
+    "candidate loopback STCP E2E including auth/TLS rejection, cleanup and in-memory configuration"
+  ],
+  "not_verified": [
+    "physical iPhone signing/installation/Keychain behavior",
+    "screen locking, network switching, long-term background/battery",
+    "real remote VPS/Windows/Ollama inference",
+    "App Store/TestFlight"
+  ],
+  "distribution": "unsigned iOS 15+ arm64 preview; user-authorized signing or existing compatible installation method required",
+  "public_history": "new repository with one audited root commit; no previous internal history copied",
+  "build_privacy": "isolated neutral Go module with trimpath, prefix maps, Mach-O debug path stripping; all IPA entries scanned",
+  "prior_application_validation": [
+    "Simulator Debug build",
+    "loopback-only STCP E2E",
+    "simulator launch; physical device not verified"
+  ],
+  "release_ipa": {
+    "filename": "FrpClient-1.2.0-unsigned-trimpath.ipa",
+    "sha256": "6d54958949991431849c17c9dbe2aed982796ab7dd7c79f1de2d29346945f8ac",
+    "bytes": 6308092
+  }
+}

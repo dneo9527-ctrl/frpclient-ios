@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "version": "1.2.0",
+  "build": "3",
+  "sha256": "6d54958949991431849c17c9dbe2aed982796ab7dd7c79f1de2d29346945f8ac",
+  "bytes": 6308092,
+  "default_fields": {
+    "serverAddr": "empty",
+    "auth.token": "empty",
+    "secretKey": "empty"
+  },
+  "new_profiles": "3 empty slots; checked by controller regression tests",
+  "payload_allowlist": "exactly 5 app files; no config, preferences, Keychain, original IPA or test fixtures",
+  "binary_defaults": "exact audited blank TOML literal found",
+  "payload_path_scan": "all entries checked for personal build paths and named test fixtures in UTF-8/UTF-16",
+  "scope": "current default source and final IPA; no live private data read; not an audit of all Git history"
+}
