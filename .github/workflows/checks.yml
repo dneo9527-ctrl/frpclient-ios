@@ -21,7 +21,7 @@ jobs:
           cache-dependency-path: go/go.sum
       - name: Download locked modules
         working-directory: go
-        run: go mod download
+        run: go mod download all
       - name: Race regression
         working-directory: go
         run: go test -race ./frpclib -count=1 -v
