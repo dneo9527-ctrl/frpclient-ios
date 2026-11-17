@@ -42,7 +42,7 @@ def audit(ipa, root):
         markers = [b'/Users/', b'/Volumes/', b'/home/', b'\\Users\\',
                    b'worker-runs', b'software-release-center',
                    b'synthetic-slot-one-token', b'synthetic-slot-two-secret',
-                   b'test-token-long-value', b'e2e-token-only']
+                   b'test-token-long-value', b'e2e-token-only', b'recovery-synthetic-private', b'reliability-secret-fixture']
         for name in names:
             raw = archive.read(name)
             for marker in markers:
@@ -51,12 +51,12 @@ def audit(ipa, root):
                     require(needle not in raw, 'private build path or test fixture in payload: ' + name)
         binary = archive.read(prefix + 'FrpClient')
         require(sample.encode('utf-8') in binary, 'final binary does not contain the audited blank defaults')
-        for marker in [b'synthetic-slot-one-token', b'synthetic-slot-two-secret', b'test-token-long-value', b'e2e-token-only']:
+        for marker in [b'synthetic-slot-one-token', b'synthetic-slot-two-secret', b'test-token-long-value', b'e2e-token-only', b'recovery-synthetic-private', b'reliability-secret-fixture']:
             require(marker not in binary, 'test credential fixture unexpectedly embedded in app')
         info = plistlib.loads(archive.read(prefix + 'Info.plist'))
         require(info['CFBundleShortVersionString'] == (root / 'VERSION').read_text().strip(),
                 'IPA version and source VERSION disagree')
-        require(info['CFBundleVersion'] == '3', 'unexpected build number')
+        require(info['CFBundleVersion'] == '4', 'unexpected build number')
         require(info['CFBundleIdentifier'] == 'com.doc.frpclient', 'unexpected bundle identifier')
     return {
         'status': 'passed', 'version': info['CFBundleShortVersionString'], 'build': info['CFBundleVersion'],

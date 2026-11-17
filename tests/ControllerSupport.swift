@@ -14,20 +14,60 @@ final class KeepAlive {
 final class MemoryStore: ConfigStore {
     var value: String?
     var loadFails = false
+    var loadInvalidData = false
     var saveFails = false
+    var failReadAfterNextSave = false
+    // Model a provider accepting one write, reporting failure, then rejecting
+    // the attempted rollback. The independently verified backup must survive.
+    var acceptNextWriteThenFail = false
+    private var readFailuresRemaining = 0
+    var loadFailureStatus: Int32 = -25308
+    var recoveryValue: String?
+    var recoveryLoadFails = false
+    var recoverySaveFails = false
+    var discardRecoveryWrites = false
     // A successful API return is not enough to permit deleting legacy data:
     // model a storage provider that does not commit the requested value.
     var discardWrites = false
     private(set) var writes = 0
+    private(set) var recoveryWrites = 0
+    private(set) var operations: [String] = []
     init(_ value: String? = "test-profile") { self.value = value }
     func load() throws -> String? {
-        if loadFails { throw ConfigStoreError.keychain(-25308) }
+        operations.append("load")
+        if loadInvalidData { throw ConfigStoreError.invalidData }
+        if readFailuresRemaining > 0 {
+            readFailuresRemaining -= 1
+            throw ConfigStoreError.keychain(loadFailureStatus)
+        }
+        if loadFails { throw ConfigStoreError.keychain(loadFailureStatus) }
         return value
     }
     func save(_ value: String) throws {
+        operations.append("save")
         if saveFails { throw ConfigStoreError.keychain(-25308) }
         writes += 1
         if !discardWrites { self.value = value }
+        if acceptNextWriteThenFail {
+            acceptNextWriteThenFail = false
+            saveFails = true
+            throw ConfigStoreError.keychain(-25308)
+        }
+        if failReadAfterNextSave {
+            failReadAfterNextSave = false
+            readFailuresRemaining = 1
+        }
+    }
+    func loadRecovery() throws -> String? {
+        operations.append("loadRecovery")
+        if recoveryLoadFails { throw ConfigStoreError.keychain(-25308) }
+        return recoveryValue
+    }
+    func saveRecovery(_ value: String) throws {
+        operations.append("saveRecovery")
+        if recoverySaveFails { throw ConfigStoreError.keychain(-25308) }
+        recoveryWrites += 1
+        if !discardRecoveryWrites { recoveryValue = value }
     }
 }
 
@@ -52,6 +92,12 @@ final class FakeRuntime: FrpRuntime {
     var stopCount: Int { lock.withLock { stops } }
     func configInfo(_ text: String) throws -> ConfigInfo {
         if text.hasPrefix("invalid-profile") { throw ConfigStoreError.invalidData }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The fake accepts the legacy table fixture, but rejects JSON arrays
+        // rather than treating every bracket-prefixed value as valid TOML.
+        if trimmed.hasPrefix("[") && !trimmed.hasPrefix("[auth]") {
+            throw ConfigStoreError.invalidData
+        }
         let port = text == "alternate-profile" ? 11435 : 11434
         return ConfigInfo(serverAddr: "relay.example.invalid", serverPort: 7000,
                           token: "test-token", secretKey: "test-secret", visitorName: "visitor-test",
@@ -130,10 +176,10 @@ struct Fixture {
     let location: KeepAlive
     let controller: FrpcController
     init(runtime: FakeRuntime = FakeRuntime(), store: MemoryStore = MemoryStore(), retryDelays: [TimeInterval] = [0.02, 0.03], pollInterval: TimeInterval = 0.01,
-         legacy: String? = nil) {
+         legacy: String? = nil, defaultsSuite: String? = nil) {
         ProbeProtocol.reset()
         self.runtime = runtime; self.store = store
-        suite = "FrpClient.ControllerTests." + UUID().uuidString
+        suite = defaultsSuite ?? ("FrpClient.ControllerTests." + UUID().uuidString)
         defaults = UserDefaults(suiteName: suite)!
         if let legacy { defaults.set(legacy, forKey: FrpcController.legacyKey) }
         location = KeepAlive()

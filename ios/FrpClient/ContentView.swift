@@ -15,6 +15,8 @@ struct ContentView: View {
     @State private var showCertificateImporter = false
     @State private var certificateImportSlot = 0
     @State private var showAdvancedConfirmation = false
+    @State private var showRecoveryPreparation = false
+    @State private var showRecoveryRestore = false
 
     var body: some View {
         NavigationView {
@@ -38,6 +40,8 @@ struct ContentView: View {
                 copiedAddress = false
                 showReplaceConfirmation = false
                 showAdvancedConfirmation = false
+                showRecoveryPreparation = false
+                showRecoveryRestore = false
             }
             .onChange(of: scenePhase) { phase in
                 if phase == .active {
@@ -64,6 +68,25 @@ struct ContentView: View {
             } message: {
                 Text("高级模式使用 TOML 内容连接。请选择保存当前表单，或使用已有的 TOML。")
             }
+            .alert("保护原数据后重新配置？", isPresented: $showRecoveryPreparation) {
+                Button("取消", role: .cancel) {}
+                Button("保护原数据并重新配置", role: .destructive) {
+                    if controller.preserveAndResetConfig() {
+                        showSecrets = false
+                        showOptions = false
+                    }
+                }
+            } message: {
+                Text("先把原配置保存在本机钥匙串的恢复副本中，写入并读回确认后，才创建三组空白配置。备份失败不会替换原数据；已有的不同恢复副本也不会被覆盖。此操作不会把配置发送到其他设备。")
+            }
+            .alert("恢复钥匙串中的原配置？", isPresented: $showRecoveryRestore) {
+                Button("取消", role: .cancel) {}
+                Button("恢复原配置") {
+                    if controller.restoreRecoveryConfig() { showSecrets = false }
+                }
+            } message: {
+                Text("恢复副本会重新成为当前配置，副本仍会保留。仅在三组配置均为空白时可恢复，避免覆盖新的设置。原数据若已损坏或来自较新版本，恢复后可能仍需对应版本或原配置来源。")
+            }
             .fileImporter(isPresented: $showCertificateImporter, allowedContentTypes: [.data, .text], allowsMultipleSelection: false) { result in
                 if controller.selectedSlot == certificateImportSlot,
                    case .success(let urls) = result, let url = urls.first {
@@ -82,7 +105,7 @@ struct ContentView: View {
             })) {
                 ForEach(0..<3) { slot in Text("配置 \(slot + 1)").tag(slot) }
             }.pickerStyle(.segmented).disabled(!controller.canEdit)
-            Text(controller.canEdit ? "切换时保存当前草稿。三组地址、密钥和高级设置独立保存在本机钥匙串。" : "请先停止连接，等待停止完成后再切换配置。")
+            Text(controller.canEdit ? "切换时保存当前草稿。三组地址、密钥和高级设置独立保存在本机钥匙串。" : controller.configEditMessage)
                 .font(.footnote).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
         }.cardStyle()
     }
@@ -135,7 +158,7 @@ struct ContentView: View {
                     Button(action: { applyFormOrConnect(connect: true) }) {
                         Label("保存并连接", systemImage: "bolt.horizontal.fill").frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent).disabled(controller.isBusy)
+                    .buttonStyle(.borderedProminent).disabled(!controller.canEdit)
                 }
                 Button(action: controller.testTunnel) {
                     HStack(spacing: 6) {
@@ -186,6 +209,7 @@ struct ContentView: View {
     private var configurationCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label("配置 \(controller.selectedSlot + 1) 的连接设置", systemImage: "slider.horizontal.3").font(.headline)
+            if controller.storageState != .available { storageRecoveryCard }
             Picker("配置方式", selection: Binding(get: { controller.formMode }, set: { form in
                 if !form && controller.formMode { showAdvancedConfirmation = true }
                 else { controller.formMode = form }
@@ -199,9 +223,78 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if !controller.canEdit {
-                Label("停止连接后可修改配置。", systemImage: "lock").font(.footnote).foregroundColor(.secondary)
+                Label(controller.configEditMessage, systemImage: "lock").font(.footnote).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if controller.recoveryAvailable {
+                recoveryBackupCard
             }
         }.cardStyle()
+    }
+
+    private var storageRecoveryCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(storageRecoveryTitle, systemImage: "exclamationmark.triangle")
+                .font(.subheadline.weight(.semibold)).foregroundColor(.orange)
+            Text(storageRecoveryExplanation)
+                .font(.footnote).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if controller.canRetryConfigRead {
+                Button("重试读取", action: controller.retryConfigRead)
+                    .buttonStyle(.bordered).font(.footnote)
+            }
+            if controller.canPrepareRecovery {
+                Button("保护原数据后重新配置") { showRecoveryPreparation = true }
+                    .buttonStyle(.bordered).font(.footnote)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Color.orange.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var recoveryBackupCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Label("钥匙串中保留了原配置副本", systemImage: "archivebox")
+                .font(.subheadline.weight(.semibold))
+            Text("恢复副本只保存在本机。恢复不会覆盖已填写的新配置，也不会删除副本。")
+                .font(.footnote).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if controller.canRestoreRecovery {
+                Button("恢复原配置") { showRecoveryRestore = true }
+                    .buttonStyle(.bordered).font(.footnote)
+            } else {
+                Text("三组配置均为空白、停止连接后，才能恢复原配置。")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Color.accentColor.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var storageRecoveryTitle: String {
+        switch controller.storageState {
+        case .available: return "配置可以使用"
+        case .temporarilyUnavailable: return "配置暂时无法读取"
+        case .corrupt: return "配置数据无法识别"
+        case .unsupportedVersion: return "当前版本不支持此配置格式"
+        }
+    }
+
+    private var storageRecoveryExplanation: String {
+        switch controller.storageState {
+        case .available: return ""
+        case .temporarilyUnavailable:
+            return controller.configEditMessage
+        case .corrupt:
+            return "原数据已保留，当前无法载入。可以先重试读取；若需重新填写，必须先成功保存恢复副本。"
+        case .unsupportedVersion:
+            return "当前版本无法读取这种配置格式。优先使用保存它的版本；也可保护原数据后重新填写，恢复副本会保留在本机钥匙串。"
+        }
     }
 
     private var basicForm: some View {
@@ -269,7 +362,7 @@ struct ContentView: View {
             Toggle(isOn: $controller.backgroundEnabled) {
                 Label("后台连接辅助", systemImage: "location.circle").font(.headline)
             }
-            Text("使用粗略定位争取后台运行时间；位置不保存、不上传。锁屏、低电量或系统回收仍可能中断连接，不能保证一直在线。")
+            Text("会记住此开关的选择。使用粗略定位争取后台运行时间；位置不保存、不上传。锁屏、低电量或系统回收仍可能中断连接，不能保证一直在线。")
                 .font(.footnote).foregroundColor(.secondary)
             if controller.backgroundEnabled {
                 VStack(alignment: .leading, spacing: 6) {
@@ -350,7 +443,8 @@ struct ContentView: View {
     private var phaseColor: Color {
         switch controller.phase {
         case .ready: return .green
-        case .connecting, .reconnecting, .stopping: return .orange
+        case .running: return .blue
+        case .connecting, .reconnecting, .stopping, .apiUnavailable: return .orange
         case .failed: return .red
         case .stopped: return .secondary
         }
@@ -360,6 +454,8 @@ struct ContentView: View {
         switch controller.phase {
         case .ready: return "checkmark.circle.fill"
         case .connecting: return "antenna.radiowaves.left.and.right"
+        case .running: return "network"
+        case .apiUnavailable: return "exclamationmark.bubble"
         case .reconnecting: return "arrow.triangle.2.circlepath"
         case .stopping: return "pause.circle.fill"
         case .failed: return "exclamationmark.circle.fill"

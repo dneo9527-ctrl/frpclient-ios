@@ -29,7 +29,34 @@ import Foundation
             ("Starting, running and stopping block slot switching", testSwitchLifecycleBarrier),
             ("Retry delay blocks slot switching until user Stop", testSwitchRetryBarrier),
             ("Runtime ownership blocks switching even if UI appears idle", testRuntimeOwnershipBarrier),
-            ("Slot switch invalidates queued logs and previous health state", testSlotCallbackIsolation)
+            ("Slot switch invalidates queued logs and previous health state", testSlotCallbackIsolation),
+            ("Background preference survives cold launch and opt-out stops location", testBackgroundPreference),
+            ("Unreadable store only allows retry and never recovery writes", testUnavailableRecoveryGate),
+            ("Nontext Keychain data stays protected without destructive recovery", testNontextRecoveryGate),
+            ("Corrupt and unsupported storage have distinct recovery reasons", testRecoveryClassification),
+            ("Recovery backup is verified before reset removes legacy", testRecoveryResetSuccess),
+            ("Backup failures never replace protected main or legacy data", testRecoveryBackupFailures),
+            ("Existing different or invalid recovery copies are never overwritten", testRecoveryBackupConflict),
+            ("Reset write failure retains backup and can be retried idempotently", testRecoveryResetWriteFailure),
+            ("Reset readback mismatch retains source and backup", testRecoveryResetMismatch),
+            ("Reset post-write read failure restores the original main data", testRecoveryResetPostWriteReadFailure),
+            ("Recovery copy survives cold launch and restores exact protected values", testRecoveryColdRestore),
+            ("Restoration refuses unsaved form or TOML drafts", testRecoveryDraftBarrier),
+            ("Restoration refuses new saved credentials in any slot", testRecoverySavedConfigBarrier),
+            ("Restoration refuses externally changed main or recovery copy", testRecoveryExternalChange),
+            ("Failed restoration never loses recovery data or empty current slots", testRecoveryRestoreFailures),
+            ("Recovery reset and restore respect underlying runtime ownership", testRecoveryRuntimeBarrier),
+            ("Running task is distinct from an unverified model interface", testRunningPhase),
+            ("HTTP and schema errors do not claim tunnel reconnection", testAPIUnavailablePhase),
+            ("Network recovery returns to verification without restarting live task", testNetworkPhaseRecovery),
+            ("Probe result queued before network loss cannot mark offline ready", testNetworkRejectsOldProbe),
+            ("Oversized protected configuration never permits reset", testRecoverySizeLimit),
+            ("Legacy TOML beginning with an auth table remains migratable", testTableFirstLegacyMigration),
+            ("Failed reset and rollback keep an independently recoverable original", testRecoveryRollbackDoubleFailure),
+            ("Recovery reset rechecks an externally changed protected original", testRecoveryResetExternalChange),
+            ("Encoded snapshot size limits are enforced before enabling recovery", testRecoveryEncodedSizeLimit),
+            ("Offline gate rejects new manual and timer-driven probes", testOfflineProbeGate),
+            ("Missing signing entitlement has an accurate non-destructive hint", testMissingKeychainEntitlement)
         ]
         var failures = 0
         for (name, test) in tests {
@@ -241,7 +268,7 @@ import Foundation
             try check(f.controller.configText.contains("auth.token = \"\"") && f.controller.configText.contains("secretKey = \"\""),
                       "default TOML contains credentials")
         }
-        try check((f.defaults.persistentDomain(forName: f.suite) ?? [:]).isEmpty, "private profile data leaked into preferences")
+        try assertNoPrivatePreferences(f)
     }
     static func testSingleKeychainMigration() throws {
         let store = MemoryStore("protected-test-profile")
@@ -277,7 +304,7 @@ import Foundation
         let reloaded = Fixture(store: store); defer { reloaded.cleanup() }
         try check(reloaded.controller.selectedSlot == 1 && reloaded.controller.profile == second, "restart lost selected slot or credentials")
         try check(reloaded.controller.selectSlot(0) && reloaded.controller.profile == draft, "restart lost other slot draft")
-        try check((f.defaults.persistentDomain(forName: f.suite) ?? [:]).isEmpty, "draft saved to preferences")
+        try assertNoPrivatePreferences(f)
     }
     static func testAdvancedSlotIsolation() throws {
         let f = Fixture(); defer { f.cleanup() }
@@ -377,4 +404,416 @@ import Foundation
         try check(waitFor { f.controller.logText.contains("fresh-log") }, "new session logs not rebound")
         try check(!f.controller.logText.contains("test-token") && !f.controller.logText.contains("test-secret"), "new log leaked credentials")
     }
+    static let brokenConfig = "{recovery-synthetic-private-broken"
+    static let futureConfig = #"{"schemaVersion":99,"selectedSlot":2,"slots":[]}"#
+    static let recoveryLegacy = "reliability-secret-fixture-legacy"
+
+    static func assertNoPrivatePreferences(_ f: Fixture) throws {
+        let preferences = f.defaults.persistentDomain(forName: f.suite) ?? [:]
+        try check(Set(preferences.keys).isSubset(of: [FrpcController.backgroundPreferenceKey]),
+                  "private configuration or draft entered UserDefaults")
+        if let value = preferences[FrpcController.backgroundPreferenceKey] {
+            try check(value is Bool || value is NSNumber, "background preference is not a boolean")
+        }
+    }
+    static func recoveryDocument(_ store: MemoryStore) throws -> [String: Any] {
+        guard let value = store.recoveryValue, let data = value.data(using: .utf8),
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TestFailure(description: "recovery snapshot is absent or invalid")
+        }
+        return root
+    }
+    static func emptyAfterRecovery(_ f: Fixture) throws {
+        try check(f.controller.storageState == .available && f.controller.canEdit,
+                  "successful recovery did not permit editing")
+        try check(f.controller.selectedSlot == 0 && f.controller.phase == .stopped,
+                  "reset retained selection or connection state")
+        for index in 0..<3 {
+            try check(storedTOML(f.store, index) == FrpcController.sampleConfig,
+                      "reset did not protect all three empty defaults")
+        }
+        try check(f.controller.profile.serverAddr.isEmpty && f.controller.profile.token.isEmpty && f.controller.profile.secretKey.isEmpty,
+                  "reset profile contains old credentials")
+        try check(f.controller.recoveryAvailable && f.controller.canRestoreRecovery,
+                  "protected recovery copy unavailable after reset")
+    }
+    static func testBackgroundPreference() throws {
+        let f = Fixture(); defer { f.cleanup() }
+        try check(f.controller.backgroundEnabled, "first launch changed compatible default")
+        try check(f.location.starts == 0, "initialization started location")
+        try startAndWait(f)
+        try check(f.location.active, "default background assistance not active")
+        f.controller.backgroundEnabled = false
+        try check(!f.location.active, "opting out left location active")
+        try check(f.defaults.object(forKey: FrpcController.backgroundPreferenceKey) as? Bool == false,
+                  "opt-out not saved as a boolean")
+        f.controller.stop()
+        try check(waitFor { f.controller.phase == .stopped }, "first controller did not stop")
+        let again = Fixture(store: f.store, defaultsSuite: f.suite); defer { again.cleanup() }
+        try check(!again.controller.backgroundEnabled && again.location.starts == 0,
+                  "cold launch forgot opt-out or started location")
+        try startAndWait(again)
+        try check(!again.location.active && again.location.starts == 0,
+                  "reconnecting after cold launch ignored opt-out")
+        again.controller.backgroundEnabled = true
+        try check(again.location.active, "explicit opt-in did not resume assistance")
+        try assertNoPrivatePreferences(again)
+    }
+    static func testUnavailableRecoveryGate() throws {
+        let store = MemoryStore(brokenConfig); store.loadFails = true
+        let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+        try check(f.controller.storageState == .temporarilyUnavailable && f.controller.canRetryConfigRead,
+                  "locked Keychain reason not exposed")
+        try check(!f.controller.canPrepareRecovery && !f.controller.preserveAndResetConfig(),
+                  "temporary read failure allowed replacing unknown data")
+        f.controller.retryConfigRead()
+        try check(store.writes == 0 && store.recoveryWrites == 0 && store.value == brokenConfig,
+                  "retry while locked wrote configuration")
+        try check(f.defaults.string(forKey: FrpcController.legacyKey) == recoveryLegacy,
+                  "locked retry deleted plaintext fallback")
+        store.loadFails = false
+        f.controller.retryConfigRead()
+        try check(f.controller.storageState == .corrupt && f.controller.canPrepareRecovery,
+                  "successful retry did not classify actual protected data")
+        try check(store.writes == 0 && store.recoveryWrites == 0, "classification retry wrote data")
+    }
+    static func testNontextRecoveryGate() throws {
+        let store = MemoryStore("opaque-nontext-data"); store.loadInvalidData = true
+        let f = Fixture(store: store); defer { f.cleanup() }
+        try check(f.controller.storageState == .corrupt && f.controller.canRetryConfigRead,
+                  "nontext data lost protection")
+        try check(!f.controller.canPrepareRecovery && !f.controller.preserveAndResetConfig(),
+                  "unreadable original bytes were treated as backed-up text")
+        try check(store.writes == 0 && store.recoveryWrites == 0, "nontext recovery altered storage")
+    }
+    static func testRecoveryClassification() throws {
+        for (payload, expected) in [(brokenConfig, ConfigStorageState.corrupt),
+                                    ("[invalid array", .corrupt),
+                                    (futureConfig, .unsupportedVersion)] {
+            let store = MemoryStore(payload)
+            let f = Fixture(store: store); defer { f.cleanup() }
+            try check(f.controller.storageState == expected && f.controller.canPrepareRecovery,
+                      "protected storage classification is inaccurate")
+            try check(!f.controller.canEdit && !f.controller.configEditMessage.contains("停止连接"),
+                      "idle storage failure still asks the user to stop a nonexistent tunnel")
+            try check(store.value == payload && store.writes == 0, "classification rewrote protected data")
+        }
+    }
+    static func testRecoveryResetSuccess() throws {
+        let store = MemoryStore(brokenConfig)
+        let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+        let before = store.operations.count
+        try check(f.controller.preserveAndResetConfig(), "backup and reset failed")
+        try emptyAfterRecovery(f)
+        let backup = try recoveryDocument(store)
+        try check(backup["protected"] as? String == brokenConfig && backup["legacy"] as? String == recoveryLegacy,
+                  "recovery snapshot failed to preserve exact original values")
+        try check(backup["schemaVersion"] as? Int == 1, "unsupported recovery schema written")
+        try check(f.defaults.object(forKey: FrpcController.legacyKey) == nil,
+                  "verified reset retained plaintext fallback")
+        let operations = Array(store.operations.dropFirst(before))
+        guard let backupWrite = operations.firstIndex(of: "saveRecovery"),
+              let backupRead = operations[operations.index(after: backupWrite)...].firstIndex(of: "loadRecovery"),
+              let mainWrite = operations.firstIndex(of: "save") else {
+            throw TestFailure(description: "recovery operations missing")
+        }
+        try check(backupWrite < backupRead && backupRead < mainWrite,
+                  "main data replaced before backup readback verification")
+        try check(!f.controller.logText.contains(recoveryLegacy) && !f.controller.logText.contains(brokenConfig),
+                  "recovery values entered diagnostics")
+    }
+    static func testRecoveryBackupFailures() throws {
+        for failure in 0..<3 {
+            let store = MemoryStore(brokenConfig)
+            let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+            if failure == 0 { store.recoverySaveFails = true }
+            else if failure == 1 { store.discardRecoveryWrites = true }
+            else { store.recoveryLoadFails = true }
+            try check(!f.controller.preserveAndResetConfig(), "failed backup reported success")
+            try check(store.value == brokenConfig && store.writes == 0,
+                      "backup failure replaced the main original")
+            try check(f.defaults.string(forKey: FrpcController.legacyKey) == recoveryLegacy,
+                      "backup failure removed legacy original")
+            try check(f.controller.storageState == .corrupt && !f.controller.canEdit,
+                      "backup failure unlocked UI")
+        }
+    }
+    static func testRecoveryBackupConflict() throws {
+        for previous in ["{corrupt recovery snapshot", #"{"schemaVersion":1,"protected":"another-original","legacy":"another-legacy"}"#] {
+            let store = MemoryStore(brokenConfig); store.recoveryValue = previous
+            let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+            try check(!f.controller.preserveAndResetConfig(), "different recovery copy was silently replaced")
+            try check(store.recoveryValue == previous && store.recoveryWrites == 0 && store.value == brokenConfig && store.writes == 0,
+                      "recovery conflict changed either protected copy")
+            try check(f.defaults.string(forKey: FrpcController.legacyKey) == recoveryLegacy,
+                      "recovery conflict removed legacy")
+        }
+    }
+    static func testRecoveryResetWriteFailure() throws {
+        let store = MemoryStore(brokenConfig)
+        let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+        store.saveFails = true
+        try check(!f.controller.preserveAndResetConfig(), "failed main write reported reset success")
+        let backup = store.recoveryValue
+        try check(backup != nil && store.value == brokenConfig && f.controller.storageState == .corrupt,
+                  "failed reset lost source, recovery copy or protected UI")
+        try check(f.defaults.string(forKey: FrpcController.legacyKey) == recoveryLegacy,
+                  "failed reset removed legacy")
+        store.saveFails = false
+        try check(f.controller.preserveAndResetConfig(), "verified existing same backup could not retry")
+        try check(store.recoveryWrites == 1 && store.recoveryValue == backup, "idempotent retry rewrote protected backup")
+        try emptyAfterRecovery(f)
+    }
+    static func testRecoveryResetMismatch() throws {
+        let store = MemoryStore(brokenConfig); store.discardWrites = true
+        let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+        try check(!f.controller.preserveAndResetConfig(), "uncommitted reset reported success")
+        try check(store.value == brokenConfig && store.recoveryValue != nil && !f.controller.canEdit,
+                  "main mismatch lost source or unlocked editor")
+        try check(f.defaults.string(forKey: FrpcController.legacyKey) == recoveryLegacy,
+                  "main mismatch removed fallback")
+    }
+    static func testRecoveryResetPostWriteReadFailure() throws {
+        let store = MemoryStore(brokenConfig)
+        let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+        store.failReadAfterNextSave = true
+        try check(!f.controller.preserveAndResetConfig(), "failed post-write read reported success")
+        try check(store.value == brokenConfig && store.recoveryValue != nil && store.writes >= 2,
+                  "accepted reset write was not rolled back after unverified read")
+        try check(f.controller.storageState == .corrupt && f.defaults.string(forKey: FrpcController.legacyKey) == recoveryLegacy,
+                  "post-write read failure discarded protected state or legacy")
+    }
+    static func testRecoveryColdRestore() throws {
+        for original in [brokenConfig, futureConfig] {
+            let store = MemoryStore(original)
+            let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+            try check(f.controller.preserveAndResetConfig(), "reset failed")
+            let backup = store.recoveryValue
+            let again = Fixture(store: store, defaultsSuite: f.suite); defer { again.cleanup() }
+            try check(again.controller.recoveryAvailable && again.controller.canRestoreRecovery,
+                      "cold launch lost access to recovery snapshot")
+            try check(again.controller.restoreRecoveryConfig(), "explicit restore failed")
+            try check(store.value == original && store.recoveryValue == backup,
+                      "restore did not preserve exact source and backup")
+            try check(again.defaults.string(forKey: FrpcController.legacyKey) == recoveryLegacy,
+                      "restoration lost legacy original")
+            let expected: ConfigStorageState = original == futureConfig ? .unsupportedVersion : .corrupt
+            try check(again.controller.storageState == expected && !again.controller.canEdit,
+                      "restored unreadable original was incorrectly marked repaired")
+        }
+    }
+    static func testRecoveryDraftBarrier() throws {
+        for kind in 0..<2 {
+            let store = MemoryStore(brokenConfig)
+            let f = Fixture(store: store); defer { f.cleanup() }
+            try check(f.controller.preserveAndResetConfig(), "reset failed")
+            let before = store.value
+            if kind == 0 { f.controller.profile.token = "new-unsaved-reliability-secret-fixture" }
+            else { f.controller.configText += "\n# unsaved raw edits" }
+            try check(!f.controller.canRestoreRecovery && !f.controller.restoreRecoveryConfig(),
+                      "recovery overwrote an unsaved draft")
+            try check(store.value == before, "blocked draft recovery touched main storage")
+        }
+    }
+    static func testRecoverySavedConfigBarrier() throws {
+        let store = MemoryStore(brokenConfig)
+        let f = Fixture(store: store); defer { f.cleanup() }
+        try check(f.controller.preserveAndResetConfig() && f.controller.selectSlot(2), "reset or selection failed")
+        f.controller.profile.serverAddr = "new-computer.example.invalid"
+        f.controller.profile.token = "new-saved-reliability-secret-fixture"
+        try check(f.controller.saveConfig() && f.controller.selectSlot(0), "new profile save failed")
+        let before = store.value
+        try check(!f.controller.canRestoreRecovery && !f.controller.restoreRecoveryConfig(),
+                  "recovery replaced a new configuration in another slot")
+        try check(store.value == before && store.recoveryValue != nil, "new credentials or backup lost")
+    }
+    static func testRecoveryExternalChange() throws {
+        for target in 0..<2 {
+            let store = MemoryStore(brokenConfig)
+            let f = Fixture(store: store); defer { f.cleanup() }
+            try check(f.controller.preserveAndResetConfig(), "reset failed")
+            let expected = store.value
+            if target == 0 { store.value = "externally-saved-reliability-secret-fixture" }
+            else { store.recoveryValue = #"{"schemaVersion":1,"protected":"different-external-original"}"# }
+            let externalMain = store.value, externalBackup = store.recoveryValue, writes = store.writes
+            try check(!f.controller.restoreRecoveryConfig(), "stale recovery snapshot overwrote external changes")
+            try check(store.value == externalMain && store.recoveryValue == externalBackup && store.writes == writes,
+                      "recovery failed to preserve externally changed data")
+            if target == 1 { try check(store.value == expected, "changed backup affected main slots") }
+        }
+    }
+    static func testRecoveryRestoreFailures() throws {
+        for failure in 0..<3 {
+            let store = MemoryStore(brokenConfig)
+            let f = Fixture(store: store); defer { f.cleanup() }
+            try check(f.controller.preserveAndResetConfig(), "reset failed")
+            let empty = store.value, backup = store.recoveryValue
+            if failure == 0 { store.saveFails = true }
+            else if failure == 1 { store.discardWrites = true }
+            else { store.failReadAfterNextSave = true }
+            try check(!f.controller.restoreRecoveryConfig(), "unverified restore reported success")
+            try check(store.value == empty && store.recoveryValue == backup,
+                      "restore failure lost empty current slots or original backup")
+            try check(f.controller.storageState == .available && f.controller.canRestoreRecovery,
+                      "failed restore lost retry path")
+        }
+    }
+    static func testRecoveryRuntimeBarrier() throws {
+        let store = MemoryStore(brokenConfig)
+        let f = Fixture(store: store); defer { f.cleanup() }
+        f.runtime.forceOwnership(running: true, stopping: true)
+        try check(!f.controller.canPrepareRecovery && !f.controller.preserveAndResetConfig(),
+                  "underlying run allowed replacing protected configuration")
+        f.runtime.forceOwnership(running: false, stopping: false)
+        try check(f.controller.preserveAndResetConfig(), "released runtime did not allow reset")
+        let empty = store.value
+        f.runtime.forceOwnership(running: true, stopping: true)
+        try check(!f.controller.canRestoreRecovery && !f.controller.restoreRecoveryConfig() && store.value == empty,
+                  "underlying run allowed restoring configuration")
+        f.runtime.forceOwnership(running: false, stopping: false)
+    }
+    static func testRunningPhase() throws {
+        let f = Fixture(); defer { f.cleanup() }
+        try startAndWait(f)
+        try check(f.controller.phase == .running && !f.controller.statusDetail.contains("中继已连接"),
+                  "task startup implies an authenticated/verified endpoint")
+        try check(f.controller.models.isEmpty && f.runtime.startCount == 1, "running task inherited health")
+    }
+    static func testAPIUnavailablePhase() throws {
+        for (status, body) in [(500, "synthetic service error"), (200, "<html>wrong service</html>")] {
+            let f = Fixture(); defer { f.cleanup() }
+            try startAndWait(f)
+            f.controller.testTunnel()
+            try check(waitFor { ProbeProtocol.count == 1 }, "probe absent")
+            ProbeProtocol.complete(0, status: status, body: body)
+            try check(waitFor { !f.controller.isTesting }, "probe did not finish")
+            try check(f.controller.phase == .apiUnavailable && f.controller.isRunning,
+                      "API failure claimed tunnel reconnection or stopped run")
+            drain(0.08)
+            try check(f.runtime.startCount == 1 && f.runtime.stopCount == 0,
+                      "API failure restarted the physical tunnel")
+            f.controller.testTunnel()
+            try check(waitFor { ProbeProtocol.count == 2 }, "recovery probe absent")
+            ProbeProtocol.complete(1, body: #"{"models":[{"name":"recovery-model"}]}"#)
+            try check(waitFor { f.controller.phase == .ready }, "API health did not recover")
+        }
+    }
+    static func testNetworkPhaseRecovery() throws {
+        let f = Fixture(); defer { f.cleanup() }
+        try startAndWait(f)
+        f.controller.networkChanged(available: false)
+        try check(f.controller.phase == .reconnecting, "physical offline state not identified")
+        f.controller.networkChanged(available: true)
+        try check(f.controller.phase == .running, "network recovery did not return to verification")
+        try check(waitFor { ProbeProtocol.count == 1 }, "recovered network did not verify API")
+        ProbeProtocol.complete(0, body: #"{"models":[]}"#)
+        try check(waitFor { f.controller.phase == .ready }, "recovered API remained offline")
+        try check(f.runtime.startCount == 1, "network recovery duplicated a living tunnel")
+    }
+    static func testNetworkRejectsOldProbe() throws {
+        let f = Fixture(); defer { f.cleanup() }
+        try startAndWait(f)
+        f.controller.testTunnel()
+        try check(waitFor { ProbeProtocol.count == 1 }, "probe absent")
+        ProbeProtocol.complete(0, body: #"{"models":[{"name":"late-success"}]}"#)
+        f.controller.networkChanged(available: false)
+        drain()
+        try check(f.controller.phase == .reconnecting && f.controller.models.isEmpty,
+                  "queued pre-offline success overrode network loss")
+    }
+    static func testRecoverySizeLimit() throws {
+        let oversized = "{" + String(repeating: "x", count: 1_048_576)
+        let store = MemoryStore(oversized)
+        let f = Fixture(store: store); defer { f.cleanup() }
+        try check(f.controller.storageState == .corrupt && !f.controller.canPrepareRecovery,
+                  "oversized protected data permits unbounded backup/reset")
+        try check(!f.controller.preserveAndResetConfig() && store.value == oversized && store.writes == 0 && store.recoveryWrites == 0,
+                  "oversized configuration changed protected storage")
+    }
+
+    static func testTableFirstLegacyMigration() throws {
+        let legacy = "[auth]\nmethod = \"token\"\ntoken = \"synthetic-table-first-token\"\n"
+        let store = MemoryStore(legacy)
+        let f = Fixture(store: store); defer { f.cleanup() }
+        try check(f.controller.storageState == .available && f.controller.canEdit,
+                  "valid legacy TOML table was classified as corrupt JSON")
+        try check(storedTOML(store) == legacy && storedTOML(store, 1) == FrpcController.sampleConfig,
+                  "legacy table config did not migrate exactly into slot one")
+        try check(store.recoveryWrites == 0, "valid legacy migration created a destructive recovery flow")
+    }
+
+    static func testRecoveryRollbackDoubleFailure() throws {
+        let store = MemoryStore(brokenConfig)
+        let f = Fixture(store: store, legacy: recoveryLegacy); defer { f.cleanup() }
+        store.acceptNextWriteThenFail = true
+        try check(!f.controller.preserveAndResetConfig(), "partially accepted reset reported success")
+        let backup = try recoveryDocument(store)
+        try check(backup["protected"] as? String == brokenConfig && backup["legacy"] as? String == recoveryLegacy,
+                  "a failed reset/rollback lost the independently verified original")
+        try check(f.defaults.string(forKey: FrpcController.legacyKey) == recoveryLegacy && !f.controller.canEdit,
+                  "partial reset removed legacy or marked UI successful")
+        // The store may contain the accepted blank write. Reopen after it
+        // becomes writable, then restore from the separate backup explicitly.
+        store.saveFails = false
+        let again = Fixture(store: store, defaultsSuite: f.suite); defer { again.cleanup() }
+        try check(again.controller.recoveryAvailable && again.controller.canRestoreRecovery,
+                  "partial reset left no cold-launch recovery path")
+        try check(again.controller.restoreRecoveryConfig() && store.value == brokenConfig,
+                  "verified backup could not recover after main and rollback failures")
+    }
+    static func testRecoveryResetExternalChange() throws {
+        let store = MemoryStore(brokenConfig)
+        let f = Fixture(store: store); defer { f.cleanup() }
+        store.value = "externally-updated-reliability-secret-fixture"
+        try check(!f.controller.preserveAndResetConfig(), "stale reset overwrote a different original")
+        try check(store.recoveryWrites == 0 && storedTOML(store) == "externally-updated-reliability-secret-fixture",
+                  "external configuration was reset rather than reread")
+        try check(f.controller.storageState == .available && f.controller.configText == "externally-updated-reliability-secret-fixture",
+                  "external original not loaded for review")
+    }
+    static func testRecoveryEncodedSizeLimit() throws {
+        // The raw text fits, but JSON escaping doubles these bytes. Backup
+        // capacity must be checked before a recovery button is enabled.
+        let escaped = "{" + String(repeating: "\n", count: 600_000)
+        let store = MemoryStore(escaped)
+        let f = Fixture(store: store); defer { f.cleanup() }
+        try check(escaped.utf8.count < 1_048_576 && f.controller.storageState == .corrupt,
+                  "encoded-size fixture does not represent protected malformed text")
+        try check(!f.controller.canPrepareRecovery && !f.controller.preserveAndResetConfig(),
+                  "raw-size-only check enabled an impossible recovery snapshot")
+        try check(store.value == escaped && store.writes == 0 && store.recoveryWrites == 0,
+                  "oversized encoded backup touched either storage item")
+        try check(f.controller.configEditMessage.contains("容量") || f.controller.configEditMessage.contains("上限"),
+                  "backup size restriction not explained")
+    }
+
+    static func testMissingKeychainEntitlement() throws {
+        let store = MemoryStore(nil)
+        store.loadFails = true
+        store.loadFailureStatus = -34018
+        let f = Fixture(store: store); defer { f.cleanup() }
+        try check(f.controller.storageState == .temporarilyUnavailable, "access error misclassified")
+        try check(f.controller.configEditMessage.contains("签名") && f.controller.configEditMessage.contains("权限"),
+                  "signing problem was described as an unlock-only problem")
+        try check(!f.controller.canPrepareRecovery && !f.controller.preserveAndResetConfig(), "access failure allowed replacement")
+        try check(store.writes == 0 && store.recoveryWrites == 0, "access failure modified storage")
+    }
+
+    static func testOfflineProbeGate() throws {
+        let f = Fixture(); defer { f.cleanup() }
+        try startAndWait(f)
+        f.controller.networkChanged(available: false)
+        f.controller.testTunnel()
+        f.controller.refreshOnForeground()
+        drain(0.15)
+        try check(ProbeProtocol.count == 0 && !f.controller.isTesting,
+                  "offline manual/foreground checks sent a loopback health request")
+        try check(f.controller.phase == .reconnecting && f.controller.testResult.contains("网络"),
+                  "offline probe claimed API readiness or obscured physical network state")
+        f.controller.networkChanged(available: true)
+        try check(waitFor { ProbeProtocol.count == 1 }, "network recovery did not reopen probe gate")
+        ProbeProtocol.complete(0, body: #"{"models":[]}"#)
+        try check(waitFor { f.controller.phase == .ready }, "recovered valid probe rejected")
+    }
+
 }

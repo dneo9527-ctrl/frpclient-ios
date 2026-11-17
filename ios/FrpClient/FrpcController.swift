@@ -7,17 +7,29 @@ import Frpclib
 #endif
 
 enum TunnelPhase: Equatable {
-    case stopped, connecting, ready, reconnecting, stopping, failed
+    case stopped, connecting, running, ready, apiUnavailable, reconnecting, stopping, failed
     var title: String {
         switch self {
         case .stopped: return "未连接"
         case .connecting: return "正在连接"
+        case .running: return "隧道任务运行中"
+        case .apiUnavailable: return "模型接口暂不可用"
         case .ready: return "模型接口可用"
         case .reconnecting: return "正在恢复连接"
         case .stopping: return "正在停止"
         case .failed: return "连接失败"
         }
     }
+}
+
+enum ConfigStorageState: Equatable {
+    case available, temporarilyUnavailable, corrupt, unsupportedVersion
+}
+
+private struct ConfigRecoverySnapshot: Codable, Equatable {
+    var schemaVersion = 1
+    var protected: String
+    var legacy: String?
 }
 
 struct ConnectionProfile: Codable, Equatable {
@@ -100,18 +112,31 @@ protocol FrpRuntime: AnyObject {
 protocol ConfigStore {
     func load() throws -> String?
     func save(_ value: String) throws
+    func loadRecovery() throws -> String?
+    func saveRecovery(_ value: String) throws
 }
-enum ConfigStoreError: Error { case keychain(OSStatus), invalidData }
+extension ConfigStore {
+    // Old/injected stores must opt into recovery; unsupported storage never
+    // permits a destructive fallback without a verified protected backup.
+    func loadRecovery() throws -> String? { throw ConfigStoreError.recoveryUnavailable }
+    func saveRecovery(_ value: String) throws { throw ConfigStoreError.recoveryUnavailable }
+}
+enum ConfigStoreError: Error { case keychain(OSStatus), invalidData, recoveryUnavailable, recoveryConflict }
 
 /// Advanced settings may also contain secrets, so protect the entire TOML.
 final class KeychainConfigStore: ConfigStore {
-    private let identity: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "com.doc.frpclient.configuration",
-        kSecAttrAccount as String: "frpcConfigTOML"
-    ]
-    func load() throws -> String? {
-        var query = identity
+    private func identity(account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: "com.doc.frpclient.configuration",
+         kSecAttrAccount as String: account]
+    }
+    func load() throws -> String? { try load(account: "frpcConfigTOML") }
+    func save(_ value: String) throws { try save(value, account: "frpcConfigTOML") }
+    func loadRecovery() throws -> String? { try load(account: "frpcConfigRecoveryV1") }
+    func saveRecovery(_ value: String) throws { try save(value, account: "frpcConfigRecoveryV1") }
+
+    private func load(account: String) throws -> String? {
+        var query = identity(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
@@ -123,14 +148,15 @@ final class KeychainConfigStore: ConfigStore {
         }
         return text
     }
-    func save(_ value: String) throws {
+    private func save(_ value: String, account: String) throws {
+        let query = identity(account: account)
         let attributes: [String: Any] = [
             kSecValueData as String: Data(value.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
-        var status = SecItemUpdate(identity as CFDictionary, attributes as CFDictionary)
+        var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
-            status = SecItemAdd(identity.merging(attributes) { _, new in new } as CFDictionary, nil)
+            status = SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil)
         }
         guard status == errSecSuccess else { throw ConfigStoreError.keychain(status) }
     }
@@ -200,6 +226,7 @@ struct ModelList: Decodable {
 /// UI state is confined to the main queue; Go lifecycle calls share one worker queue.
 final class FrpcController: ObservableObject {
     static let legacyKey = "frpcConfigTOML"
+    static let backgroundPreferenceKey = "frpcBackgroundEnabled"
     static let sampleConfig = """
     serverAddr = ""
     serverPort = 7000
@@ -236,12 +263,41 @@ final class FrpcController: ObservableObject {
     @Published private(set) var endpoint = "http://127.0.0.1:11434"
     @Published private(set) var storageMessage = ""
     @Published private(set) var logText = ""
-    @Published var backgroundEnabled = true { didSet { updateLocation() } }
+    @Published private(set) var storageState: ConfigStorageState = .available
+    @Published private(set) var recoveryAvailable = false
+    @Published var backgroundEnabled = true {
+        didSet {
+            defaults.set(backgroundEnabled, forKey: Self.backgroundPreferenceKey)
+            updateLocation()
+        }
+    }
     @Published private var desiredRunning = false
     let keepAlive: KeepAlive
     let frpVersion: String
     var canStop: Bool { desiredRunning || isRunning || isBusy || phase == .stopping }
-    var canEdit: Bool { !canStop && !storageReadBlocked && !runtime.isRunning && !runtime.isStopping }
+    private var runtimeIsIdle: Bool { !canStop && !runtime.isRunning && !runtime.isStopping }
+    var canEdit: Bool { runtimeIsIdle && !storageReadBlocked }
+    var canRetryConfigRead: Bool { runtimeIsIdle && storageReadBlocked }
+    var canPrepareRecovery: Bool {
+        runtimeIsIdle && (storageState == .corrupt || storageState == .unsupportedVersion) && recoverySnapshotFits
+    }
+    var canRestoreRecovery: Bool {
+        runtimeIsIdle && !storageReadBlocked && recoveryAvailable && currentSlotsAreEmpty &&
+            defaults.string(forKey: Self.legacyKey) == nil
+    }
+    var configEditMessage: String {
+        if !runtimeIsIdle { return "停止连接并等待任务退出后可修改配置。" }
+        switch storageState {
+        case .available: return ""
+        case .temporarilyUnavailable: return storageMessage
+        case .corrupt:
+            return recoverySnapshotFits ? "配置数据无法解析，原数据已保护；可重新读取或保护后重新配置。"
+                : "配置数据无法解析或超出恢复容量；原记录未覆盖，请使用兼容版本或保留的配置来源。"
+        case .unsupportedVersion:
+            return recoverySnapshotFits ? "配置由其他版本写入，请优先使用兼容版本；也可保护后重新配置。"
+                : "配置格式与本版本不兼容，且超出恢复容量；原记录未覆盖，请使用兼容版本。"
+        }
+    }
     private let runtime: FrpRuntime
     private let store: ConfigStore
     private let defaults: UserDefaults
@@ -261,8 +317,25 @@ final class FrpcController: ObservableObject {
     private var nextProbe = Date.distantPast
     private var monitor: NWPathMonitor?
     private var lastPathAvailable: Bool?
-    private var storageReadBlocked = false
+    private var storageReadBlocked: Bool { storageState != .available }
+    private var blockedProtected: String?
+    private var recoverySnapshot: ConfigRecoverySnapshot?
+    private var recoveryEncoded: String?
     private var storedProfiles: StoredProfiles
+    private var currentSlotsAreEmpty: Bool {
+        currentStoredProfiles().slots == StoredProfiles.empty(sampleConfig: Self.sampleConfig).slots
+    }
+    private var recoverySnapshotFits: Bool {
+        guard let original = blockedProtected else { return false }
+        return Self.encodeRecovery(ConfigRecoverySnapshot(protected: original,
+                              legacy: defaults.string(forKey: Self.legacyKey))) != nil
+    }
+    private static func encodeRecovery(_ snapshot: ConfigRecoverySnapshot) -> String? {
+        guard snapshot.protected.utf8.count <= 1_048_576,
+              (snapshot.legacy?.utf8.count ?? 0) <= 1_048_576,
+              let data = try? JSONEncoder().encode(snapshot), data.count <= 1_048_576 else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
 
     init(runtime: FrpRuntime? = nil, store: ConfigStore = KeychainConfigStore(),
          defaults: UserDefaults = .standard, keepAlive: KeepAlive = KeepAlive(),
@@ -291,7 +364,11 @@ final class FrpcController: ObservableObject {
         }
         configText = Self.sampleConfig
         storedProfiles = StoredProfiles.empty(sampleConfig: Self.sampleConfig)
+        // Initialization does not invoke didSet: restore the non-secret choice
+        // before any lifecycle path is allowed to start location updates.
+        backgroundEnabled = defaults.object(forKey: Self.backgroundPreferenceKey) as? Bool ?? true
         restoreConfig()
+        reloadRecoveryAvailability()
         bindRuntimeLogs()
         if monitorNetwork {
             let pathMonitor = NWPathMonitor()
@@ -314,8 +391,13 @@ final class FrpcController: ObservableObject {
         do {
             let protected = try store.load()
             let legacy = defaults.string(forKey: Self.legacyKey)
-            storageReadBlocked = false
+            storageState = .available
+            blockedProtected = nil
             if let protected {
+                guard protected.utf8.count <= 1_048_576 else {
+                    blockConfig(.corrupt, protected: nil, message: "配置超过恢复上限，原数据未覆盖。请使用原版本或可信备份恢复。")
+                    return
+                }
                 if let bundle = Self.decodeStoredProfiles(protected), bundle.isValid {
                     storedProfiles = bundle
                     selectedSlot = bundle.selectedSlot
@@ -324,15 +406,24 @@ final class FrpcController: ObservableObject {
                     if legacy != nil {
                         do {
                             try persist(bundle)
-                            defaults.removeObject(forKey: Self.legacyKey)
                         } catch { storageMessage = "旧存储仍被保留，等待钥匙串保存验证成功。" }
                     }
                     return
                 }
                 let trimmed = protected.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.hasPrefix("{") else {
-                    storageReadBlocked = true
-                    storageMessage = "钥匙串中的多配置数据无法读取；未覆盖原数据。"
+                // Legacy TOML can start with a table header such as [auth].
+                // A leading '[' alone is not evidence of a JSON document.
+                let validTableLedTOML = trimmed.hasPrefix("[") && (try? runtime.configInfo(protected)) != nil
+                if trimmed.hasPrefix("{") || (trimmed.hasPrefix("[") && !validTableLedTOML) {
+                    if let data = protected.data(using: .utf8),
+                       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let schema = root["schemaVersion"] as? Int, schema != StoredProfiles.currentSchema {
+                        blockConfig(.unsupportedVersion, protected: protected,
+                                    message: "配置格式与本版本不兼容；原数据未覆盖，请优先使用兼容版本。")
+                    } else {
+                        blockConfig(.corrupt, protected: protected,
+                                    message: "钥匙串中的多配置数据无法解析，原数据未覆盖。")
+                    }
                     return
                 }
                 migrateLegacyConfig(protected, removeUserDefaults: legacy != nil)
@@ -342,11 +433,150 @@ final class FrpcController: ObservableObject {
                 migrateLegacyConfig(legacy, removeUserDefaults: true)
                 return
             }
+            storedProfiles = StoredProfiles.empty(sampleConfig: Self.sampleConfig)
+            selectedSlot = 0
             loadSelectedSlot()
             storageMessage = "3 组配置保存在本机钥匙串。"
+        } catch ConfigStoreError.invalidData {
+            blockConfig(.corrupt, protected: nil,
+                        message: "钥匙串内容无法读取为配置文字，原数据未覆盖。请使用兼容版本恢复。")
+        } catch ConfigStoreError.keychain(let status) {
+            let message: String
+            if status == errSecMissingEntitlement {
+                message = "当前签名缺少钥匙串访问权限，请核对安装或签名方式后重试；原配置未覆盖。"
+            } else if status == errSecAuthFailed {
+                message = "钥匙串访问被拒绝，请核对设备与签名权限后重试；原配置未覆盖。"
+            } else {
+                message = "钥匙串暂不可读取。请解锁设备后重试；若仍失败，请检查安装与签名方式。原配置未覆盖。"
+            }
+            blockConfig(.temporarilyUnavailable, protected: nil, message: message)
         } catch {
-            storageReadBlocked = true
-            storageMessage = "钥匙串暂不可读取。请解锁设备后返回本应用；旧配置不会被覆盖。"
+            blockConfig(.temporarilyUnavailable, protected: nil,
+                        message: "钥匙串暂不可读取。请解锁设备后重新读取；旧配置不会被覆盖。")
+        }
+    }
+
+    private func blockConfig(_ state: ConfigStorageState, protected: String?, message: String) {
+        storageState = state
+        blockedProtected = protected
+        storageMessage = message
+    }
+
+    func retryConfigRead() {
+        guard canRetryConfigRead else { return }
+        restoreConfig()
+        reloadRecoveryAvailability()
+    }
+
+    private static func decodeRecovery(_ text: String) -> ConfigRecoverySnapshot? {
+        guard text.utf8.count <= 1_048_576, let data = text.data(using: .utf8),
+              let snapshot = try? JSONDecoder().decode(ConfigRecoverySnapshot.self, from: data),
+              snapshot.schemaVersion == 1,
+              snapshot.protected.utf8.count <= 1_048_576,
+              (snapshot.legacy?.utf8.count ?? 0) <= 1_048_576 else { return nil }
+        return snapshot
+    }
+
+    private func reloadRecoveryAvailability() {
+        recoveryAvailable = false
+        recoverySnapshot = nil
+        recoveryEncoded = nil
+        guard let value = try? store.loadRecovery(), let decoded = Self.decodeRecovery(value) else { return }
+        recoverySnapshot = decoded
+        recoveryEncoded = value
+        recoveryAvailable = true
+    }
+
+    /// UI confirmation is required before this action. The complete original
+    /// text and legacy value are verified in a separate Keychain item first.
+    /// No recovery item is ever overwritten with different data or removed.
+    @discardableResult func preserveAndResetConfig() -> Bool {
+        guard canPrepareRecovery, let expected = blockedProtected else { return false }
+        let previousState = storageState
+        do {
+            guard try store.load() == expected else {
+                restoreConfig()
+                storageMessage = "存储在操作前发生变化，已重新读取；请检查后再操作。"
+                return false
+            }
+            let original = ConfigRecoverySnapshot(protected: expected,
+                                                   legacy: defaults.string(forKey: Self.legacyKey))
+            guard let encoded = Self.encodeRecovery(original) else { throw ConfigStoreError.invalidData }
+            if let previous = try store.loadRecovery() {
+                guard Self.decodeRecovery(previous) == original else { throw ConfigStoreError.recoveryConflict }
+            } else {
+                try store.saveRecovery(encoded)
+            }
+            guard let protectedBackup = try store.loadRecovery(), Self.decodeRecovery(protectedBackup) == original else {
+                throw ConfigStoreError.invalidData
+            }
+            recoverySnapshot = original
+            recoveryEncoded = protectedBackup
+            recoveryAvailable = true
+            let empty = StoredProfiles.empty(sampleConfig: Self.sampleConfig)
+            let emptyValue = String(decoding: try JSONEncoder().encode(empty), as: UTF8.self)
+            do { try writeVerifiedConfig(emptyValue) }
+            catch {
+                // Some stores fail after accepting a write. Attempt restoration;
+                // the verified recovery item remains the authoritative fallback.
+                try? writeVerifiedConfig(expected)
+                throw error
+            }
+            defaults.removeObject(forKey: Self.legacyKey)
+            storedProfiles = empty
+            selectedSlot = 0
+            storageState = .available
+            blockedProtected = nil
+            loadSelectedSlot()
+            generation &+= 1
+            activeInfo = nil; activeConfig = ""
+            invalidateTest(); clearLog(); lastError = ""
+            phase = .stopped
+            statusDetail = "原数据已保护，填写新配置后可连接。"
+            storageMessage = "原配置已保存在独立钥匙串恢复项；当前载入空白配置，恢复项未删除。"
+            return true
+        } catch ConfigStoreError.recoveryConflict {
+            storageState = previousState
+            storageMessage = "已存在另一份恢复数据，未覆盖它，也未改动当前配置。请保留两份来源并使用兼容版本处理。"
+        } catch {
+            storageState = previousState
+            storageMessage = "恢复保护或新配置写入未验证成功，操作未完成；原数据与已写入的恢复项均保留。请解锁后重试。"
+        }
+        return false
+    }
+
+    /// Restoring an unreadable original deliberately re-enters its protected
+    /// state. A later compatible app can read it; this app never claims repair.
+    @discardableResult func restoreRecoveryConfig() -> Bool {
+        guard canRestoreRecovery, let expected = recoverySnapshot, let archived = recoveryEncoded else { return false }
+        do {
+            guard try store.loadRecovery() == archived else {
+                reloadRecoveryAvailability()
+                storageMessage = "恢复项已发生变化，请重新检查后再恢复。"
+                return false
+            }
+            guard let current = try store.load(), let bundle = Self.decodeStoredProfiles(current), bundle.isValid,
+                  bundle.slots == StoredProfiles.empty(sampleConfig: Self.sampleConfig).slots,
+                  currentSlotsAreEmpty, defaults.string(forKey: Self.legacyKey) == nil else {
+                storageMessage = "当前存储已有配置或草稿，未用恢复项覆盖。"
+                return false
+            }
+            do { try writeVerifiedConfig(expected.protected) }
+            catch {
+                try? writeVerifiedConfig(current)
+                throw error
+            }
+            if let legacy = expected.legacy { defaults.set(legacy, forKey: Self.legacyKey) }
+            restoreConfig()
+            reloadRecoveryAvailability()
+            storageMessage = storageReadBlocked
+                ? "已恢复原始数据；其格式仍无法由本版本读取，原数据与恢复项均保留，请使用兼容版本。"
+                : "原始数据已恢复，独立钥匙串恢复项仍保留。"
+            lastError = ""
+            return true
+        } catch {
+            storageMessage = "恢复写入未验证成功，操作未完成；当前数据与恢复项均保留，请解锁后重试。"
+            return false
         }
     }
 
@@ -405,7 +635,7 @@ final class FrpcController: ObservableObject {
     @discardableResult func selectSlot(_ index: Int) -> Bool {
         guard (0..<3).contains(index) else { return false }
         guard index != selectedSlot else { return true }
-        guard canEdit else { lastError = "停止连接后才能切换配置。"; return false }
+        guard canEdit else { lastError = configEditMessage; return false }
         let previous = storedProfiles
         var candidate = currentStoredProfiles()
         candidate.selectedSlot = index
@@ -578,6 +808,10 @@ final class FrpcController: ObservableObject {
                 guard epoch == self.generation, self.desiredRunning else { return }
                 self.isBusy = false; self.isRunning = running
                 if failure != nil || !running { self.handleExit(error); return }
+                self.phase = self.lastPathAvailable == false ? .reconnecting : .running
+                self.statusDetail = self.lastPathAvailable == false
+                    ? "网络不可用，等待网络恢复。"
+                    : "隧道任务已启动，正在等待模型接口验证；尚不能据此确认中继登录成功。"
                 self.updateLocation()
                 self.nextProbe = Date().addingTimeInterval(1)
                 self.startPolling()
@@ -650,6 +884,11 @@ final class FrpcController: ObservableObject {
               let info = activeInfo, let url = URL(string: info.testURL) else {
             if !canStop { testResult = "请先连接隧道。" }; return
         }
+        guard lastPathAvailable != false else {
+            phase = .reconnecting
+            testResult = "网络不可用，等待网络恢复后再测试。"
+            return
+        }
         testTask?.cancel(); testGeneration &+= 1
         let ticket = testGeneration, epoch = generation
         isTesting = true; testResult = "正在测试模型接口…"; models = []
@@ -676,12 +915,15 @@ final class FrpcController: ObservableObject {
         testTask?.resume()
     }
     private func probeFailed(_ message: String) {
-        phase = .reconnecting; testResult = message
-        statusDetail = "隧道任务仍在运行，模型接口暂不可用；15 秒后再测。请检查远端电脑和 Ollama。"
+        phase = lastPathAvailable == false ? .reconnecting : .apiUnavailable
+        testResult = message
+        statusDetail = lastPathAvailable == false
+            ? "网络不可用，等待网络恢复。"
+            : "隧道任务仍在运行，模型接口暂不可用；15 秒后再测。请检查远端电脑和 Ollama。"
     }
     func refreshOnForeground() {
         keepAlive.refreshStatus()
-        if storageReadBlocked && !canStop { restoreConfig() }
+        if storageReadBlocked && runtimeIsIdle { retryConfigRead() }
         if desiredRunning, !isBusy { nextProbe = .distantPast; poll() }
     }
     func networkChanged(available: Bool) {
@@ -690,7 +932,11 @@ final class FrpcController: ObservableObject {
         if !available, desiredRunning {
             invalidateTest(); phase = .reconnecting; statusDetail = "网络不可用，等待网络恢复。"
         } else if recovered, desiredRunning {
-            if isRunning { nextProbe = .distantPast; poll() }
+            if isRunning {
+                phase = .running
+                statusDetail = "网络已恢复，隧道任务仍在运行；正在重新验证模型接口。"
+                nextProbe = .distantPast; poll()
+            }
             else if !isBusy, attempt <= retryDelays.count { cancelRetry(); launchAttempt() }
         }
     }
